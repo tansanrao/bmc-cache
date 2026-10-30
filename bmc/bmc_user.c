@@ -54,7 +54,7 @@ static struct bpf_progs_desc progs[] = {
 
 uint32_t fnv1a_hash32(char *key, size_t length, uint32_t hash)
 {
-	for (int i = 0; i < length; i++) {
+	for (size_t i = 0; i < length; i++) {
 		hash ^= key[i];
 		hash *= FNV_PRIME_32;
 	}
@@ -132,6 +132,8 @@ int write_stat_line(FILE *fp, int map_fd)
 static int print_bpf_verifier(enum libbpf_print_level level,
 							const char *format, va_list args)
 {
+	if (level == LIBBPF_DEBUG)
+		return 0;
 	return vfprintf(stdout, format, args);
 }
 
@@ -140,7 +142,6 @@ int main(int argc, char *argv[])
 {
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	int map_progs_xdp_fd, xdp_main_prog_fd, map_progs_tc_fd, map_progs_fd, map_stats_fd;
-	struct bpf_object_load_attr load_attr;
 	struct bpf_object *obj;
 	char filename[PATH_MAX];
 	int err, prog_count;
@@ -188,7 +189,7 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	interfaces_idx = calloc(sizeof(int), interface_count);
+	interfaces_idx = calloc(interface_count, sizeof(int));
 	if (interfaces_idx == NULL) {
 		fprintf(stderr, "Error: failed to allocate memory\n");
 		return 1;
@@ -197,7 +198,7 @@ int main(int argc, char *argv[])
 	for (int i = 0; i < interface_count && optind < argc; optind++, i++) {
 		interfaces_idx[i] = atoi(argv[optind]);
 	}
-	xdp_flags |= XDP_FLAGS_DRV_MODE;
+	xdp_flags |= XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST;
 	nr_cpus = libbpf_num_possible_cpus();
 
 	snprintf(filename, sizeof(filename), "%s_kern.o", argv[0]);
@@ -225,20 +226,19 @@ int main(int argc, char *argv[])
 	prog_count = sizeof(progs) / sizeof(progs[0]);
 
 	for (int i = 0; i < prog_count; i++) {
-		progs[i].prog = bpf_object__find_program_by_title(obj, progs[i].name);
+		char name[sizeof(progs[i].name) + sizeof("_main")];
+		snprintf(name, sizeof(name), "%.255s_main", progs[i].name);
+		progs[i].prog = bpf_object__find_program_by_name(obj, name);
 		if (!progs[i].prog) {
-			fprintf(stderr, "Error: bpf_object__find_program_by_title failed\n");
+			fprintf(stderr, "Error: bpf_object__find_program_by_name failed\n");
 			return 1;
 		}
 		bpf_program__set_type(progs[i].prog, progs[i].type);
 	}
 
-	load_attr.obj = obj;
-	load_attr.log_level = LIBBPF_WARN;
-
-	err = bpf_object__load_xattr(&load_attr);
+	err = bpf_object__load(obj);
 	if (err) {
-		fprintf(stderr, "Error: bpf_object__load_xattr failed\n");
+		fprintf(stderr, "Error: bpf_object__load failed\n");
 		return 1;
 	}
 
@@ -264,10 +264,6 @@ int main(int argc, char *argv[])
 
 		if (progs[i].map_prog_idx != -1) {
 			unsigned int map_prog_idx = progs[i].map_prog_idx;
-			if (map_prog_idx < 0) {
-				fprintf(stderr, "Error: Cannot get prog fd for bpf program %s\n", progs[i].name);
-				return 1;
-			}
 
 			switch (progs[i].type) {
 			case BPF_PROG_TYPE_XDP:
@@ -297,17 +293,8 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "Error: Program name '%s' is too long\n", progs[i].name);
 				return -1;
 			}
-retry:
-			if (bpf_program__pin_instance(progs[i].prog, filename, 0)) {
+			if (bpf_program__pin(progs[i].prog, filename)) {
 				fprintf(stderr, "Error: Failed to pin program '%s' to path %s\n", progs[i].name, filename);
-				if (errno == EEXIST) {
-					fprintf(stdout, "BPF program '%s' already pinned, unpinning it to reload it\n", progs[i].name);
-					if (bpf_program__unpin_instance(progs[i].prog, filename, 0)) {
-						fprintf(stderr, "Error: Fail to unpin program '%s' at %s\n", progs[i].name, filename);
-						return -1;
-					}
-					goto retry;
-				}
 				return -1;
 			}
 		}
@@ -326,8 +313,8 @@ retry:
 	}
 
 	for (int i = 0; i < interface_count; i++) {
-		if (bpf_set_link_xdp_fd(interfaces_idx[i], xdp_main_prog_fd, xdp_flags) < 0) {
-			fprintf(stderr, "Error: bpf_set_link_xdp_fd failed for interface %d\n", interfaces_idx[i]);
+		if (bpf_xdp_attach(interfaces_idx[i], xdp_main_prog_fd, xdp_flags, NULL) < 0) {
+			fprintf(stderr, "Error: bpf_xdp_attach failed for interface %d\n", interfaces_idx[i]);
 			return 1;
 		} else {
 			printf("Main BPF program attached to XDP on interface %d\n", interfaces_idx[i]);
@@ -393,8 +380,10 @@ retry:
 	}
 
 	for (int i = 0; i < interface_count; i++) {
-		bpf_set_link_xdp_fd(interfaces_idx[i], -1, xdp_flags);
+		bpf_xdp_detach(interfaces_idx[i], XDP_FLAGS_DRV_MODE, NULL);
 	}
 
+	bpf_object__close(obj);
+	free(interfaces_idx);
 	return ret;
 }

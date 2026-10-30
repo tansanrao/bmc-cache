@@ -19,30 +19,58 @@ Build instructions
 
 ### Building BMC
 
-BMC must be compiled with libbpf and other header files obtained from kernel sources. The project does not include the kernel sources, but the [kernel-src-download.sh](kernel-src-download.sh) and [kernel-src-prepare.sh](kernel-src-prepare.sh) scripts automate the download of the kernel sources and prepare them for the compilation of BMC.
-
-These scripts require the following software to be installed:
-
-```sh
-gpg curl tar xz make gcc flex bison libssl-dev libelf-dev
-```
-
-The project uses llvm and clang version 9 to build BMC, but more recent versions might work as well:
+This evaluation fork uses current libbpf APIs, BTF map definitions, Linux UAPI
+headers, and Clang's BPF target. It was validated with Clang 21 and Linux 7.0.
+Install `clang`, `gcc`, `make`, `libelf-dev`, and `zlib1g-dev`. From the parent
+Beekeeper repository:
 
 ```sh
-llvm-9 clang-9
+make -C bmc-cache/bmc
 ```
 
-Note that ```libelf-dev``` is also required to build libbpf and BMC.
+The build compiles static libbpf from `linux/tools/lib/bpf`, stages its headers,
+and writes `build/bmc/bmc` and `build/bmc/bmc_kern.o`. For a standalone checkout,
+pass `LINUX_PATH=/path/to/linux OUTPUT=/path/to/build` to make. Kernel-private
+headers, kernel selftests, and the old download/prepare scripts are not needed.
 
-With the previous software installed, BMC can be built with the following:
-```bash
-$ ./kernel-src-download.sh
-$ ./kernel-src-prepare.sh
-$ cd bmc && make
-```
+The runtime needs native XDP, BPF syscalls/JIT, and TC support. The parent
+Beekeeper repository's `kernelconfig` enables `CONFIG_NET_SCH_INGRESS=y`,
+`CONFIG_NET_CLS_BPF=y`, and `CONFIG_NET_ACT_BPF=y`, so its evaluation kernel
+needs no separate TC module installation/loading. The BPF action supports
+separate actions; the direct-action attachment below uses `cls_bpf`.
+For other kernels these options can instead be modules: build/install them
+for that kernel, then load `sch_ingress`, `cls_bpf`, and, if built, `act_bpf`.
+Configurations missing their built-in dependencies need a rebuilt kernel
+and a host-managed VM restart.
 
-After BMC has been successfully built, kernel sources can be removed by running the [kernel-src-remove.sh](kernel-src-remove.sh) script from the project root.
+### UDP SET evaluation scope
+
+The DurableKV workload uses single-datagram IPv4 UDP GETs and SETs on port
+11211. XDP invalidates the hashed cache slot on a UDP `set <key> ...` request;
+TC egress fills it from the subsequent userspace `VALUE` reply to a GET.
+`STORED` acknowledgements still come exclusively from DurableKV after its WAL
+sync. The invalidator reads only the command key, not `set` text in the value.
+TCP write invalidation is no longer supported. Preload over TCP **before**
+attaching BMC, and do not issue TCP writes while caching is active.
+
+This preserves upstream BMC's coherence limitation: an old GET reply can
+refill a slot between SET invalidation and commit, or after commit if the GET
+reply was delayed. BMC does not coordinate with DurableKV's WAL/publication.
+The benchmark's same-value SETs do not expose this stale-value race; results
+are throughput measurements, not a claim of linearizable cache coherence.
+
+The original 3,250,000-slot direct-mapped cache and generic 250-byte key /
+1,000-byte value limits are unchanged (about 4.29 GB of cache-map allocation).
+Recreate BMC's maps after restarting/recovering the server; do not retain
+cached values across an application restart.
+
+With an empty BMC cache and a **disposable** DurableKV server, run from the
+remote client `python3 bmc/test_udp.py SERVER_IP`. This writes three keys and
+checks changed-value UDP SET invalidation, GET refill/hits, an absent key,
+punctuation, and `set` text inside a value. Reconcile its 17 replies with server
+and BMC counters: 5 durable SETs, 5 userspace GET hits, 1 miss, 6 XDP hits,
+5 cache updates, and 2 invalidations. Do not run it against the measured
+benchmark dataset; it deliberately changes values and adds a non-workload key.
 
 ### Building Memcached-SR
 
@@ -75,15 +103,27 @@ To do so, you first need to make sure that the BPF filesystem is mounted, if it 
 # mount -t bpf none /sys/fs/bpf/
 ```
 
-Once BMC is running and the tx\_filter program has been pinned to /sys/fs/bpf/bmc\_tx\_filter, you can attach it using the tc command line:
+After preload, start BMC with the interface index (for example, from the parent
+Beekeeper repository, `sudo build/bmc/bmc $(cat /sys/class/net/exp0/ifindex)`).
+It attaches native XDP and pins `/sys/fs/bpf/bmc_tx_filter`. The loader refuses
+to replace an existing XDP program or pinned filter. In another terminal,
+attach the TC program in **direct-action** mode:
 ```bash
 # tc qdisc add dev <interface_name> clsact
-# tc filter add dev <interface_name> egress bpf object-pinned /sys/fs/bpf/bmc_tx_filter
+# tc filter add dev <interface_name> egress pref 1 handle 1 bpf da object-pinned /sys/fs/bpf/bmc_tx_filter
 ```
 
-After you are done using BMC, you can detach the program with these commands:
+Send `SIGUSR1` to the loader while idle to write `/tmp/bmc_stats.txt`. For
+benchmark deltas, read the per-CPU `map_stats` with bpftool before/after each
+trial; XDP/driver and physical NIC counters distinguish cache replies from
+userspace replies and losses. The upstream `hit_count` is not an exact wire
+reply count during invalidation races.
+
+After you are done, remove this experiment's TC attachment, stop the loader
+with SIGINT/SIGTERM (which detaches XDP), and unpin the filter. Only remove
+`clsact` if this experiment created it and no other filters use it:
 ```bash
-# tc filter del dev <interface_name> egress
+# tc filter del dev <interface_name> egress pref 1 handle 1 bpf
 # tc qdisc del dev <interface_name> clsact
 ```
 And unpin the program with ```# rm /sys/fs/bpf/bmc_tx_filter```
